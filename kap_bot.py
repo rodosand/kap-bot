@@ -7,115 +7,136 @@ from datetime import datetime
 # --- AYARLAR ---
 TELEGRAM_TOKEN = "8154362550:AAGVasRA_XzbNVRvUhhw08IhDoY4P2emCLE"
 CHAT_ID = "7229573083"
-KONTROL_ARALIGI = 120  # saniye (2 dakikada bir kontrol)
+KONTROL_ARALIGI = 60  # saniye
 
-# Takip edilecek haber türleri (KAP'taki başlıklara göre)
+# Takip edilecek haber türleri
 TAKIP_EDILEN_TURLER = [
     "Kamuyu Aydınlatma Platformu Duyurusu",
     "Pay Alım Satım Bildirimi"
 ]
 
-GORULMUS_HABERLER_DOSYASI = "gorulmus_haberler.json"
-KAP_API_URL = "https://www.kap.org.tr/tr/api/disclosures"
+GORULMUS_DOSYA = "gorulmus.json"
+KAP_API = "https://www.kap.org.tr/tr/api/disclosures"
 
-# --- YARDIMCI FONKSİYONLAR ---
-
-def gorulmus_haberleri_yukle():
-    if os.path.exists(GORULMUS_HABERLER_DOSYASI):
-        with open(GORULMUS_HABERLER_DOSYASI, "r") as f:
+def gorulmus_yukle():
+    if os.path.exists(GORULMUS_DOSYA):
+        with open(GORULMUS_DOSYA, "r") as f:
             return set(json.load(f))
     return set()
 
-def gorulmus_haberleri_kaydet(haberler):
-    # Sadece son 1000 haberi tut (dosya şişmesin)
-    liste = list(haberler)[-1000:]
-    with open(GORULMUS_HABERLER_DOSYASI, "w") as f:
+def gorulmus_kaydet(haberler):
+    liste = list(haberler)[-2000:]
+    with open(GORULMUS_DOSYA, "w") as f:
         json.dump(liste, f)
 
-def telegram_mesaj_gonder(mesaj):
+def telegram_gonder(mesaj):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    veri = {
-        "chat_id": CHAT_ID,
-        "text": mesaj,
-        "parse_mode": "HTML"
-    }
     try:
-        yanit = requests.post(url, data=veri, timeout=10)
-        yanit.raise_for_status()
+        requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": mesaj,
+            "parse_mode": "HTML"
+        }, timeout=10)
     except Exception as e:
-        print(f"Telegram mesaj hatası: {e}")
+        print(f"Telegram hatası: {e}")
 
-def kap_haberlerini_cek():
+def kap_cek(after_index=None):
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.kap.org.tr/tr/bildirim-sorgu"
     }
+    url = KAP_API
+    if after_index:
+        url += f"?afterDisclosureIndex={after_index}"
     try:
-        yanit = requests.get(KAP_API_URL, headers=headers, timeout=15)
-        yanit.raise_for_status()
-        return yanit.json()
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        print(f"KAP veri çekme hatası: {e}")
+        print(f"KAP çekme hatası: {e}")
         return []
 
-def haber_turu_eslesiyor(haber_turu):
-    if not haber_turu:
+def tur_eslesiyor(baslik):
+    if not baslik:
         return False
     for tur in TAKIP_EDILEN_TURLER:
-        if tur.lower() in haber_turu.lower():
+        if tur.lower() in baslik.lower():
             return True
     return False
 
-def haberleri_isle(haberler, gorulmus):
-    yeni_bildirimler = []
-    for haber in haberler:
-        haber_id = str(haber.get("disclosureIndex") or haber.get("id") or "")
-        if not haber_id or haber_id in gorulmus:
-            continue
-
-        haber_turu = haber.get("disclosureType") or haber.get("subject") or ""
-        if haber_turu_eslesiyor(haber_turu):
-            sirket = haber.get("companyName") or haber.get("title") or "Bilinmeyen Şirket"
-            tarih = haber.get("publishDate") or haber.get("date") or ""
-            url = f"https://www.kap.org.tr/tr/Bildirim/{haber_id}"
-
-            mesaj = (
-                f"📢 <b>KAP BİLDİRİMİ</b>\n\n"
-                f"🏢 <b>Şirket:</b> {sirket}\n"
-                f"📋 <b>Tür:</b> {haber_turu}\n"
-                f"🕐 <b>Tarih:</b> {tarih}\n"
-                f"🔗 <a href='{url}'>Bildirimi Görüntüle</a>"
-            )
-            yeni_bildirimler.append((haber_id, mesaj))
-
-    return yeni_bildirimler
-
-# --- ANA DÖNGÜ ---
-
 def main():
     print("KAP Bot başlatıldı ✅")
-    telegram_mesaj_gonder("✅ <b>KAP Bot aktif!</b>\n\nTakip edilen türler:\n• Kamuyu Aydınlatma Platformu Duyurusu\n• Pay Alım Satım Bildirimi")
+    telegram_gonder("✅ <b>KAP Bot aktif!</b>\n\nTakip edilen türler:\n• Kamuyu Aydınlatma Platformu Duyurusu\n• Pay Alım Satım Bildirimi")
 
-    gorulmus = gorulmus_haberleri_yukle()
+    gorulmus = gorulmus_yukle()
+    max_index = 0
+
+    # İlk çekişte mevcut haberleri kaydet ama bildirim gönderme
+    print("İlk veri çekiliyor...")
+    ilk_veri = kap_cek()
+    if ilk_veri:
+        for haber in ilk_veri:
+            basic = haber.get("basic", haber)
+            haber_id = str(basic.get("disclosureIndex", ""))
+            if haber_id:
+                gorulmus.add(haber_id)
+                idx = basic.get("disclosureIndex", 0)
+                if idx > max_index:
+                    max_index = idx
+        gorulmus_kaydet(gorulmus)
+        print(f"İlk veri alındı. Son index: {max_index}, {len(ilk_veri)} haber yüklendi.")
 
     while True:
         try:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] KAP kontrol ediliyor...")
-            haberler = kap_haberlerini_cek()
+            time.sleep(KONTROL_ARALIGI)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Kontrol ediliyor... (max_index={max_index})")
 
-            if haberler:
-                yeniler = haberleri_isle(haberler, gorulmus)
-                for haber_id, mesaj in yeniler:
-                    telegram_mesaj_gonder(mesaj)
-                    gorulmus.add(haber_id)
-                    print(f"Yeni bildirim gönderildi: {haber_id}")
-                gorulmus_haberleri_kaydet(gorulmus)
+            yeni_veriler = kap_cek(after_index=max_index if max_index > 0 else None)
+
+            if not yeni_veriler:
+                continue
+
+            yeni_max = max_index
+            for haber in yeni_veriler:
+                basic = haber.get("basic", haber)
+                haber_id = str(basic.get("disclosureIndex", ""))
+
+                if not haber_id or haber_id in gorulmus:
+                    continue
+
+                gorulmus.add(haber_id)
+                idx = basic.get("disclosureIndex", 0)
+                if idx > yeni_max:
+                    yeni_max = idx
+
+                baslik = basic.get("title", "")
+                if tur_eslesiyor(baslik):
+                    sirket = basic.get("companyName", "Bilinmeyen")
+                    hisse = basic.get("stockCodes", "") or basic.get("relatedStocks", "")
+                    tarih = basic.get("publishDate", "") or basic.get("disclosureDate", "")
+                    link = f"https://www.kap.org.tr/tr/Bildirim/{haber_id}"
+
+                    mesaj = (
+                        f"📢 <b>KAP BİLDİRİMİ</b>\n\n"
+                        f"🏢 <b>Şirket:</b> {sirket}\n"
+                    )
+                    if hisse:
+                        mesaj += f"📈 <b>Hisse:</b> {hisse}\n"
+                    mesaj += (
+                        f"📋 <b>Tür:</b> {baslik}\n"
+                        f"🕐 <b>Tarih:</b> {tarih}\n"
+                        f"🔗 <a href='{link}'>Bildirimi Görüntüle</a>"
+                    )
+                    telegram_gonder(mesaj)
+                    print(f"✅ Bildirim gönderildi: {sirket} - {baslik}")
+
+            if yeni_max > max_index:
+                max_index = yeni_max
+                gorulmus_kaydet(gorulmus)
 
         except Exception as e:
             print(f"Genel hata: {e}")
-
-        time.sleep(KONTROL_ARALIGI)
 
 if __name__ == "__main__":
     main()
