@@ -2,6 +2,7 @@ import requests
 import time
 import json
 import os
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # --- AYARLAR ---
@@ -16,7 +17,12 @@ TAKIP_EDILEN_TURLER = [
 ]
 
 GORULMUS_DOSYA = "gorulmus.json"
-KAP_API = "https://www.kap.org.tr/tr/api/disclosures"
+
+# KAP RSS feed linkleri
+RSS_LINKLER = [
+    "https://www.kap.org.tr/rss/bildirimler.rss",
+    "https://www.kap.org.tr/rss/bildirimler-ozet.rss",
+]
 
 def gorulmus_yukle():
     if os.path.exists(GORULMUS_DOSYA):
@@ -25,115 +31,124 @@ def gorulmus_yukle():
     return set()
 
 def gorulmus_kaydet(haberler):
-    liste = list(haberler)[-2000:]
+    liste = list(haberler)[-3000:]
     with open(GORULMUS_DOSYA, "w") as f:
         json.dump(liste, f)
 
 def telegram_gonder(mesaj):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={
+        r = requests.post(url, data={
             "chat_id": CHAT_ID,
             "text": mesaj,
             "parse_mode": "HTML"
         }, timeout=10)
+        print(f"Telegram yanıt: {r.status_code}")
     except Exception as e:
         print(f"Telegram hatası: {e}")
 
-def kap_cek(after_index=None):
+def rss_cek(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.kap.org.tr/tr/bildirim-sorgu"
+        "User-Agent": "Mozilla/5.0 (compatible; RSSReader/1.0)",
     }
-    url = KAP_API
-    if after_index:
-        url += f"?afterDisclosureIndex={after_index}"
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
-        return r.json()
+        return r.text
     except Exception as e:
-        print(f"KAP çekme hatası: {e}")
-        return []
+        print(f"RSS çekme hatası ({url}): {e}")
+        return None
 
-def tur_eslesiyor(baslik):
-    if not baslik:
-        return False
+def rss_isle(xml_text):
+    haberler = []
+    try:
+        root = ET.fromstring(xml_text)
+        ns = ""
+        channel = root.find("channel")
+        if channel is None:
+            channel = root
+
+        for item in channel.findall("item"):
+            baslik = item.findtext("title", "")
+            link = item.findtext("link", "")
+            aciklama = item.findtext("description", "")
+            tarih = item.findtext("pubDate", "")
+            guid = item.findtext("guid", link)
+
+            haberler.append({
+                "id": guid,
+                "baslik": baslik,
+                "link": link,
+                "aciklama": aciklama,
+                "tarih": tarih
+            })
+    except Exception as e:
+        print(f"RSS parse hatası: {e}")
+    return haberler
+
+def tur_eslesiyor(baslik, aciklama):
+    metin = (baslik + " " + aciklama).lower()
     for tur in TAKIP_EDILEN_TURLER:
-        if tur.lower() in baslik.lower():
+        if tur.lower() in metin:
             return True
     return False
 
 def main():
     print("KAP Bot başlatıldı ✅")
-    telegram_gonder("✅ <b>KAP Bot aktif!</b>\n\nTakip edilen türler:\n• Kamuyu Aydınlatma Platformu Duyurusu\n• Pay Alım Satım Bildirimi")
+    telegram_gonder("✅ <b>KAP Bot aktif! (RSS modu)</b>\n\nTakip edilen türler:\n• Kamuyu Aydınlatma Platformu Duyurusu\n• Pay Alım Satım Bildirimi")
 
     gorulmus = gorulmus_yukle()
-    max_index = 0
 
-    # İlk çekişte mevcut haberleri kaydet ama bildirim gönderme
-    print("İlk veri çekiliyor...")
-    ilk_veri = kap_cek()
-    if ilk_veri:
-        for haber in ilk_veri:
-            basic = haber.get("basic", haber)
-            haber_id = str(basic.get("disclosureIndex", ""))
-            if haber_id:
-                gorulmus.add(haber_id)
-                idx = basic.get("disclosureIndex", 0)
-                if idx > max_index:
-                    max_index = idx
-        gorulmus_kaydet(gorulmus)
-        print(f"İlk veri alındı. Son index: {max_index}, {len(ilk_veri)} haber yüklendi.")
+    # İlk çekişte mevcut haberleri kaydet, bildirim gönderme
+    print("İlk RSS verisi yükleniyor...")
+    for rss_url in RSS_LINKLER:
+        xml_text = rss_cek(rss_url)
+        if xml_text:
+            haberler = rss_isle(xml_text)
+            for h in haberler:
+                gorulmus.add(h["id"])
+            print(f"  {rss_url} → {len(haberler)} haber yüklendi")
+    gorulmus_kaydet(gorulmus)
+    print(f"Toplam {len(gorulmus)} haber kaydedildi, izlemeye başlanıyor...")
 
     while True:
         try:
             time.sleep(KONTROL_ARALIGI)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Kontrol ediliyor... (max_index={max_index})")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] RSS kontrol ediliyor...")
 
-            yeni_veriler = kap_cek(after_index=max_index if max_index > 0 else None)
-
-            if not yeni_veriler:
-                continue
-
-            yeni_max = max_index
-            for haber in yeni_veriler:
-                basic = haber.get("basic", haber)
-                haber_id = str(basic.get("disclosureIndex", ""))
-
-                if not haber_id or haber_id in gorulmus:
+            for rss_url in RSS_LINKLER:
+                xml_text = rss_cek(rss_url)
+                if not xml_text:
                     continue
 
-                gorulmus.add(haber_id)
-                idx = basic.get("disclosureIndex", 0)
-                if idx > yeni_max:
-                    yeni_max = idx
+                haberler = rss_isle(xml_text)
+                yeni_sayac = 0
 
-                baslik = basic.get("title", "")
-                if tur_eslesiyor(baslik):
-                    sirket = basic.get("companyName", "Bilinmeyen")
-                    hisse = basic.get("stockCodes", "") or basic.get("relatedStocks", "")
-                    tarih = basic.get("publishDate", "") or basic.get("disclosureDate", "")
-                    link = f"https://www.kap.org.tr/tr/Bildirim/{haber_id}"
+                for h in haberler:
+                    if h["id"] in gorulmus:
+                        continue
 
-                    mesaj = (
-                        f"📢 <b>KAP BİLDİRİMİ</b>\n\n"
-                        f"🏢 <b>Şirket:</b> {sirket}\n"
-                    )
-                    if hisse:
-                        mesaj += f"📈 <b>Hisse:</b> {hisse}\n"
-                    mesaj += (
-                        f"📋 <b>Tür:</b> {baslik}\n"
-                        f"🕐 <b>Tarih:</b> {tarih}\n"
-                        f"🔗 <a href='{link}'>Bildirimi Görüntüle</a>"
-                    )
-                    telegram_gonder(mesaj)
-                    print(f"✅ Bildirim gönderildi: {sirket} - {baslik}")
+                    gorulmus.add(h["id"])
+                    yeni_sayac += 1
 
-            if yeni_max > max_index:
-                max_index = yeni_max
-                gorulmus_kaydet(gorulmus)
+                    if tur_eslesiyor(h["baslik"], h["aciklama"]):
+                        mesaj = (
+                            f"📢 <b>KAP BİLDİRİMİ</b>\n\n"
+                            f"📋 <b>{h['baslik']}</b>\n"
+                        )
+                        if h["aciklama"]:
+                            mesaj += f"📝 {h['aciklama'][:200]}\n"
+                        if h["tarih"]:
+                            mesaj += f"🕐 {h['tarih']}\n"
+                        if h["link"]:
+                            mesaj += f"🔗 <a href='{h['link']}'>Bildirimi Görüntüle</a>"
+
+                        telegram_gonder(mesaj)
+                        print(f"✅ Bildirim gönderildi: {h['baslik'][:80]}")
+
+                if yeni_sayac > 0:
+                    gorulmus_kaydet(gorulmus)
+                    print(f"  {yeni_sayac} yeni haber bulundu")
 
         except Exception as e:
             print(f"Genel hata: {e}")
